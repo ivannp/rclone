@@ -698,6 +698,9 @@ func (o *Object) Size() int64 {
 // Hash returns the selected checksum of the file
 // If no checksum is available it returns ""
 func (o *Object) Hash(ctx context.Context, ht hash.Type) (string, error) {
+	if o.meta == nil {
+		return "", nil
+	}
 	return o.meta.MD5, nil
 }
 
