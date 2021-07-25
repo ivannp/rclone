@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package main;
+
+option go_package = "github.com/rclone/rclone/backend/chain";
+
+message FileHeader {
+    repeated string encoders = 1;
+    repeated bytes ivs = 2;
+    string compression = 3;
+}
