@@ -4,8 +4,12 @@ package main;
 
 option go_package = "github.com/rclone/rclone/backend/chain";
 
+message EncryptionAlgo {
+    string algo = 1;
+    bytes iv = 2;
+}
+
 message FileHeader {
-    repeated string encoders = 1;
-    repeated bytes ivs = 2;
-    string compression = 3;
+    repeated EncryptionAlgo encryptionChain = 1; 
+    string compression = 2;
 }

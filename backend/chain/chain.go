@@ -2,6 +2,8 @@ package chain
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
@@ -22,7 +24,14 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
+	"golang.org/x/crypto/twofish"
 	"google.golang.org/protobuf/proto"
+)
+
+// Constants
+const (
+	cipherKeySize   = 32 // 256 bit keys
+	cipherBlockSize = 16 // 128 bit block size
 )
 
 // Globals
@@ -37,15 +46,40 @@ func init() {
 			Help:     "Remote to encode.\nNormally should contain a ':' and a path, e.g. \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
 			Required: true,
 		}, {
-			Name:     "compression",
-			Help:     "Compression algorithm.",
-			Default:  "zstd",
+			Name:    "compression",
+			Help:    "Compression algorithm.",
+			Default: "zstd",
+			Examples: []fs.OptionExample{
+				{
+					Value: "lzma",
+					Help:  "Use LZMA compression.",
+				},
+				{
+					Value: "xz",
+					Help:  "Use xz compression.",
+				},
+				{
+					Value: "zlib",
+					Help:  "Use zlib compression. Levels available: 0-9, default: 6.",
+				},
+				{
+					Value: "zstd",
+					Help:  "Use zstd compression. Levels available: SpeedFastest, SpeedDefault, SpeedBetterCompression and SpeedBestCompression.",
+				},
+			},
 			Advanced: true,
 		}, {
-			Name:     "encryption",
-			Help:     "Encryption algorithm chain.",
-			Default:  "",
+			Name:     "ciphers",
+			Help:     "Ciphers to use to encrypt data. A comma separated list of the following ciphers: aes, twofish and serpent.",
+			Default:  "aes",
 			Advanced: true,
+		}, {
+			Name:       "password",
+			Help:       "Password or pass phrase for encryption.",
+			IsPassword: true,
+		}, {
+			Name: "hex-key",
+			Help: "The encryption key in hex. 32 bytes (256 bits) for each encryption algorithm in the encryption chain.",
 		}},
 	})
 }
@@ -54,7 +88,14 @@ func init() {
 type Options struct {
 	Remote      string `config:"remote"`
 	Compression string `config:"compression"`
-	Encryption  string `config:"encryption"`
+	CipherNames string `config:"ciphers"`
+	HexKey      string `config:"hex-key"`
+
+	// Fields computed from the rest. No (de)serialization.
+	Algos   []string       `config:"-"` // The encryption algorithms
+	Ciphers []cipher.Block `config:"-"`
+	Keys    [][]byte       `config:"-"` // The keys for each cipher
+	Key     []byte         `config:"-"` // The full key
 }
 
 // Fs represents a wrapped fs.Fs
@@ -67,15 +108,64 @@ type Fs struct {
 	features *fs.Features // optional features
 }
 
-const (
-	defaultIvLength = 16
-)
+// Initializes the computed (not deserialized) options
+func (options *Options) init() error {
+	options.Algos = strings.Split(options.CipherNames, ",")
+	if len(options.Algos) == 0 {
+		return nil
+	}
+
+	var nciphers = len(options.Algos)
+
+	var fullKeySize = cipherKeySize * nciphers
+
+	var err error
+
+	if len(options.HexKey) > 0 {
+		options.Key, err = hex.DecodeString(options.HexKey)
+		if err != nil {
+			return err
+		}
+		if fullKeySize > len(options.Key) {
+			return fmt.Errorf("the key must be %d bytes long", fullKeySize)
+		}
+	}
+
+	options.Keys = make([][]byte, nciphers)
+	options.Ciphers = make([]cipher.Block, nciphers)
+	for i := 0; i < nciphers; i++ {
+		options.Keys[i] = options.Key[(i * cipherKeySize):((i + 1) * cipherKeySize)]
+
+		var algo = strings.ToLower(options.Algos[i])
+		switch algo {
+		case "aes":
+			options.Ciphers[i], err = aes.NewCipher(options.Keys[i])
+			if err != nil {
+				return err
+			}
+		case "twofish":
+			options.Ciphers[i], err = twofish.NewCipher(options.Keys[i])
+			if err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown cipher '%s' specified", algo)
+		}
+	}
+
+	return nil
+}
 
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	err = opt.init()
 	if err != nil {
 		return nil, err
 	}
@@ -198,12 +288,17 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 func (f *Fs) buildFileHeader() (*FileHeader, error) {
 	var ans = &FileHeader{}
-	ans.Encoders = strings.Split(f.opt.Encryption, ",")
 
-	ans.Ivs = make([][]byte, len(ans.Encoders))
-	for i := 0; i < len(ans.Encoders); i++ {
-		ans.Ivs[i] = make([]byte, defaultIvLength)
-		rand.Read(ans.Ivs[i])
+	var nciphers = len(f.opt.Ciphers)
+
+	if nciphers > 0 {
+		ans.EncryptionChain = make([]*EncryptionAlgo, nciphers)
+		for i := 0; i < nciphers; i++ {
+			ans.EncryptionChain[i] = &EncryptionAlgo{}
+			ans.EncryptionChain[i].Algo = f.opt.Algos[i]
+			ans.EncryptionChain[i].Iv = make([]byte, cipherBlockSize)
+			rand.Read(ans.EncryptionChain[i].Iv)
+		}
 	}
 
 	ans.Compression = f.opt.Compression
@@ -307,10 +402,20 @@ func (f *Fs) encodeFile(in io.Reader) (*EncodedFile, error) {
 
 	var topWriter io.Writer = ans.Writer()
 
-	var zstdWriter *zstd.Encoder
+	// Add the encryption chain
+	var nciphers = len(f.opt.Ciphers)
+	if nciphers > 0 {
+		// Build the encryption chain. Backwards.
+		for i := nciphers - 1; i >= 0; i-- {
+			stream := cipher.NewCTR(f.opt.Ciphers[i], fh.EncryptionChain[i].Iv)
+			topWriter = cipher.StreamWriter{S: stream, W: topWriter}
+		}
+	}
 
+	var zstdWriter *zstd.Encoder
 	var compressionWriter io.Writer
 
+	// Add compression
 	switch fh.Compression {
 	case "zstd":
 		zstdWriter, err = zstd.NewWriter(topWriter)
@@ -509,9 +614,15 @@ func newOpenFile(o *Object, reader io.ReadCloser, fh *FileHeader) (*openFile, er
 	var topReader io.Reader = reader
 	var err error
 
+	var nciphers = len(fh.EncryptionChain)
+	for i := nciphers - 1; i >= 0; i-- {
+		stream := cipher.NewCTR(o.f.opt.Ciphers[i], fh.EncryptionChain[i].Iv)
+		topReader = cipher.StreamReader{S: stream, R: topReader}
+	}
+
 	switch fh.Compression {
 	case "zstd":
-		zstdReader, err = zstd.NewReader(reader)
+		zstdReader, err = zstd.NewReader(topReader)
 		if err != nil {
 			return nil, err
 		}
